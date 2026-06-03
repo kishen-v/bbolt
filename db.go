@@ -476,6 +476,23 @@ func (db *DB) mmap(minsz int) (err error) {
 		return err
 	}
 
+	if db.MaxSize > 0 && size > db.MaxSize {
+		// On Windows, the data file is expanded to the full mapped size during mmap,
+		// so we must reject any mmap size larger than the configured max size.
+		//
+		// On other platforms, mmap itself does not grow the file immediately, so the
+		// mapped size may exceed the max size temporarily. The file size limit is
+		// enforced later when the file actually grows.
+		//
+		// In practice, this check mainly applies when opening a database with a large
+		// InitialMmapSize. In all other cases, file growth is already guarded during
+		// page allocation.
+		if size > fileSize && runtime.GOOS == "windows" {
+			db.Logger().Errorf("[GOOS: %s, GOARCH: %s] maximum db size reached, size: %d, db.MaxSize: %d", runtime.GOOS, runtime.GOARCH, size, db.MaxSize)
+			return berrors.ErrMaxSizeReached
+		}
+	}
+
 	if db.Mlock {
 		// Unlock db memory
 		if err := db.munlock(fileSize); err != nil {
@@ -1165,6 +1182,26 @@ func (db *DB) allocate(txid common.Txid, count int) (*common.Page, error) {
 	// Resize mmap() if we're at the end.
 	p.SetId(db.rwtx.meta.Pgid())
 	var minsz = int((p.Id()+common.Pgid(count))+1) * db.pageSize
+	if db.MaxSize > 0 {
+		nextAllocSize := minsz
+		nextMmapSize, err := db.mmapSize(minsz)
+		if err != nil {
+			return nil, fmt.Errorf("mmap size calculation error: %w", err)
+		}
+		if runtime.GOOS == "windows" {
+			// nextAllocSize may not exactly match nextMmapSize.
+			// On Windows, this mismatch may cause the file size to slightly exceed maxSize,
+			// while it is harmless on other platforms.
+			nextAllocSize = nextMmapSize
+		} else {
+			// On non-Windows platforms, the database file is only grown explicitly in grow calls.
+			nextAllocSize = db.growSize(nextMmapSize, nextAllocSize)
+		}
+		if nextAllocSize > db.MaxSize {
+			db.Logger().Errorf("[GOOS: %s, GOARCH: %s] maximum db size reached, minSize: %d (allocSize: %d), db.MaxSize: %d", runtime.GOOS, runtime.GOARCH, minsz, nextAllocSize, db.MaxSize)
+			return nil, berrors.ErrMaxSizeReached
+		}
+	}
 	if minsz >= db.datasz {
 		if err := db.mmap(minsz); err != nil {
 			if err == berrors.ErrMaxSizeReached {
@@ -1195,18 +1232,7 @@ func (db *DB) grow(sz int) error {
 		return nil
 	}
 
-	// If the data is smaller than the alloc size then only allocate what's needed.
-	// Once it goes over the allocation size then allocate in chunks.
-	if db.datasz <= db.AllocSize {
-		sz = db.datasz
-	} else {
-		sz += db.AllocSize
-	}
-
-	if !db.readOnly && db.MaxSize > 0 && sz > db.MaxSize {
-		lg.Errorf("[GOOS: %s, GOARCH: %s] maximum db size reached, size: %d, db.MaxSize: %d", runtime.GOOS, runtime.GOARCH, sz, db.MaxSize)
-		return berrors.ErrMaxSizeReached
-	}
+	sz = db.growSize(db.datasz, sz)
 
 	// Truncate and fsync to ensure file size metadata is flushed.
 	// https://github.com/boltdb/bolt/issues/284
@@ -1234,6 +1260,16 @@ func (db *DB) grow(sz int) error {
 	return nil
 }
 
+func (db *DB) growSize(mmapSize, growSize int) int {
+	// If the data is smaller than the alloc size then only allocate what's needed.
+	// Once it goes over the allocation size then allocate in chunks.
+	if mmapSize <= db.AllocSize {
+		return mmapSize
+	} else {
+		return growSize + db.AllocSize
+	}
+}
+
 func (db *DB) IsReadOnly() bool {
 	return db.readOnly
 }
@@ -1253,13 +1289,16 @@ func (db *DB) freepages() []common.Pgid {
 	reachable := make(map[common.Pgid]*common.Page)
 	nofreed := make(map[common.Pgid]bool)
 	ech := make(chan error)
+
 	go func() {
-		for e := range ech {
-			panic(fmt.Sprintf("freepages: failed to get all reachable pages (%v)", e))
-		}
+		defer close(ech)
+		tx.recursivelyCheckBucket(&tx.root, reachable, nofreed, HexKVStringer(), ech)
 	}()
-	tx.recursivelyCheckBucket(&tx.root, reachable, nofreed, HexKVStringer(), ech)
-	close(ech)
+	// following for loop will exit once channel is closed in the above goroutine.
+	// we don't need to wait explictly with a waitgroup
+	for e := range ech {
+		panic(fmt.Sprintf("freepages: failed to get all reachable pages (%v)", e))
+	}
 
 	// TODO: If check bucket reported any corruptions (ech) we shouldn't proceed to freeing the pages.
 
@@ -1330,7 +1369,7 @@ type Options struct {
 	// PageSize overrides the default OS page size.
 	PageSize int
 
-	// MaxSize sets the maximum size of the data file. <=0 means no maximum.
+	// MaxSize sets the maximum size of the data file. A value <= 0 means no limit.
 	MaxSize int
 
 	// NoSync sets the initial value of DB.NoSync. Normally this can just be
